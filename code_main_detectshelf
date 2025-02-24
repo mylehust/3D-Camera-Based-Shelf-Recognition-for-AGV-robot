@@ -1,0 +1,413 @@
+#include <sys/socket.h>
+#include <arpa/inet.h>
+#include <unistd.h>
+#include <librealsense2/rs.hpp>
+#include <opencv2/opencv.hpp>
+#include <opencv2/aruco.hpp>
+#include <iostream>
+#include <sstream>
+#include <vector>
+#include <string>
+#include <map>
+#include <iomanip>
+#include <cmath>
+#include <rapidjson/document.h>
+#include <rapidjson/writer.h>
+#include <rapidjson/stringbuffer.h>
+#include <rapidjson/prettywriter.h>
+#include <chrono>
+#include <sys/resource.h>
+#include <sys/time.h>
+
+using namespace std;
+using namespace rapidjson;
+
+map<string, int> ARUCO_DICT = {
+    {"DICT_4X4_50", cv::aruco::DICT_4X4_50},
+    {"DICT_4X4_100", cv::aruco::DICT_4X4_100},
+    {"DICT_4X4_250", cv::aruco::DICT_4X4_250},
+    {"DICT_4X4_1000", cv::aruco::DICT_4X4_1000},
+    {"DICT_5X5_100", cv::aruco::DICT_5X5_100},
+    {"DICT_5X5_250", cv::aruco::DICT_5X5_250},
+    {"DICT_6X6_50", cv::aruco::DICT_6X6_50},
+    {"DICT_6X6_100", cv::aruco::DICT_6X6_100},
+    {"DICT_6X6_250", cv::aruco::DICT_6X6_250},
+    {"DICT_6X6_1000", cv::aruco::DICT_6X6_1000},
+    {"DICT_7X7_50", cv::aruco::DICT_7X7_50},
+    {"DICT_7X7_100", cv::aruco::DICT_7X7_100},
+    {"DICT_7X7_250", cv::aruco::DICT_7X7_250},
+    {"DICT_7X7_1000", cv::aruco::DICT_7X7_1000},
+    {"DICT_ARUCO_ORIGINAL", cv::aruco::DICT_ARUCO_ORIGINAL},
+    {"DICT_APRILTAG_16h5", cv::aruco::DICT_APRILTAG_16h5},
+    {"DICT_APRILTAG_25h9", cv::aruco::DICT_APRILTAG_25h9},
+    {"DICT_APRILTAG_36h10", cv::aruco::DICT_APRILTAG_36h10},
+    {"DICT_APRILTAG_36h11", cv::aruco::DICT_APRILTAG_36h11}
+};
+
+
+std::string format_float(float value) {
+    std::ostringstream out;
+    out << std::fixed << std::setprecision(2) << value;
+    return out.str();
+}
+
+struct ArucoResult {
+    bool dollyFound;
+    float cornersDistance;
+    float point1_3d[3];
+    float point2_3d[3];
+};
+
+
+
+// Hàm tính sai số giữa giá trị đo được và giá trị đầu vào
+float calculate_error(float measured_value, float input_value) {
+    return std::abs(measured_value - input_value);
+}
+
+
+
+
+// Hàm xử lý hiển thị Aruco và tính toán các giá trị cần thiết
+ArucoResult aruco_display(const vector<vector<cv::Point2f>>& original_corners, const vector<cv::Point2f>& aligned_centers, const cv::Mat& ids, cv::Mat& image, rs2::depth_frame& depth_frame, const rs2_intrinsics& depth_intrin) {
+    ArucoResult result;
+    result.dollyFound = false;
+    result.cornersDistance = 0.0f;
+
+    vector<cv::Point2f> original_centers;
+
+    // Kiểm tra nếu vector original_corners và aligned_centers không rỗng
+    if (!original_corners.empty() && !aligned_centers.empty()) {
+        // Duyệt qua tất cả các marker corners
+        for (size_t i = 0; i < original_corners.size(); i++) {
+            // Đảm bảo không vượt quá giới hạn của aligned_centers
+            if (i >= aligned_centers.size()) {
+                continue;
+            }
+
+            // Đảm bảo markerCorners có đủ 4 điểm
+            auto markerCorners = original_corners[i];
+            if (markerCorners.size() < 4) {
+                continue; // Bỏ qua nếu không đủ điểm
+            }
+
+            // Truy cập vào id của marker
+            int markerID = ids.at<int>(i, 0);
+
+            // Vẽ các cạnh của marker
+            cv::line(image, markerCorners[0], markerCorners[1], cv::Scalar(0, 255, 0), 2);
+            cv::line(image, markerCorners[1], markerCorners[2], cv::Scalar(0, 255, 0), 2);
+            cv::line(image, markerCorners[2], markerCorners[3], cv::Scalar(0, 255, 0), 2);
+            cv::line(image, markerCorners[3], markerCorners[0], cv::Scalar(0, 255, 0), 2);
+
+            // Tính toán tâm của marker trong original_corners
+            float original_cX = (markerCorners[0].x + markerCorners[2].x) / 2.0f;
+            float original_cY = (markerCorners[0].y + markerCorners[2].y) / 2.0f;
+
+            // Vẽ và hiển thị tọa độ tâm của marker
+            cv::circle(image, cv::Point(original_cX, original_cY), 3, cv::Scalar(0, 0, 255), -1);
+            cv::putText(image, "(" + format_float(original_cX) + ", " + format_float(original_cY) + ")", cv::Point(original_cX, original_cY - 10), cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(25, 0, 200), 2);
+
+            // Lấy tọa độ của aligned_centers tương ứng
+            float aligned_cX = aligned_centers[i].x;
+            float aligned_cY = aligned_centers[i].y;
+
+            // Vẽ và hiển thị tọa độ tâm của marker đã aligned
+            cv::circle(image, cv::Point(aligned_cX, aligned_cY), 3, cv::Scalar(255, 0, 255), -1);
+            cv::putText(image, "(" + format_float(aligned_cX) + ", " + format_float(aligned_cY) + ")", cv::Point(aligned_cX, aligned_cY - 10), cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(255, 0, 0), 2);
+
+            original_centers.push_back(cv::Point2f(original_cX, original_cY));
+        }
+    }
+
+    // Nếu có đủ 2 marker được tìm thấy và tính toán được vị trí của chúng
+    if (aligned_centers.size() == 2 && original_centers.size() == 2) {
+        // Tính toán midpoint cho cả aligned và original centers
+        cv::Point2f aligned_midpoint((aligned_centers[0].x + aligned_centers[1].x) / 2, (aligned_centers[0].y + aligned_centers[1].y) / 2);
+        cv::Point2f original_midpoint((original_centers[0].x + original_centers[1].x) / 2, (original_centers[0].y + original_centers[1].y) / 2);
+
+        // Vẽ midpoint trên hình ảnh
+        cv::circle(image, original_midpoint, 4, cv::Scalar(0, 255, 0), -1);
+        cv::putText(image, "Original Midpoint: (" + to_string(original_midpoint.x) + ", " + to_string(original_midpoint.y) + ")", cv::Point(original_midpoint.x, original_midpoint.y - 10), cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(0, 255, 0), 2);
+        
+        // Lấy độ sâu cho các điểm đã tính toán
+        float depth_mid = depth_frame.get_distance(static_cast<int>(aligned_midpoint.x), static_cast<int>(aligned_midpoint.y));
+        float depth_1 = depth_frame.get_distance(static_cast<int>(aligned_centers[0].x), static_cast<int>(aligned_centers[0].y));
+        float depth_2 = depth_frame.get_distance(static_cast<int>(aligned_centers[1].x), static_cast<int>(aligned_centers[1].y));
+
+        // Nếu độ sâu hợp lệ, tiếp tục tính toán 3D points
+        if (depth_mid >= 0 && depth_1 >= 0 && depth_2 >= 0) {
+            float point1_3d[3];
+            float point2_3d[3];
+
+            // Tính toán vị trí 3D cho các điểm
+            rs2_deproject_pixel_to_point(point1_3d, &depth_intrin, reinterpret_cast<const float*>(&original_centers[0]), depth_1);
+            rs2_deproject_pixel_to_point(point2_3d, &depth_intrin, reinterpret_cast<const float*>(&original_centers[1]), depth_2);
+
+            // Tính toán khoảng cách giữa hai điểm góc
+            float corners_distance = sqrt(pow(point2_3d[0] - point1_3d[0], 2) +
+                                          pow(point2_3d[1] - point1_3d[1], 2) +
+                                          pow(point2_3d[2] - point1_3d[2], 2)) * 100;
+
+            result.dollyFound = true;    
+            result.cornersDistance = corners_distance;
+            memcpy(result.point1_3d, point1_3d, sizeof(point1_3d));
+            memcpy(result.point2_3d, point2_3d, sizeof(point2_3d));
+            
+        }
+    }
+
+    return result;
+}
+
+
+
+bool send_json(const std::string& server_ip, int server_port, const std::string& json_data) {
+    int sock = 0;
+    struct sockaddr_in serv_addr;
+    if ((sock = socket(AF_INET, SOCK_STREAM, 0)) < 0) {
+        std::cerr << "Socket creation error" << std::endl;
+        return false;
+    }
+
+    serv_addr.sin_family = AF_INET;
+    serv_addr.sin_port = htons(server_port);
+
+    if (inet_pton(AF_INET, server_ip.c_str(), &serv_addr.sin_addr) <= 0) {
+        std::cerr << "Invalid address/ Address not supported" << std::endl;
+        return false;
+    }
+
+    if (connect(sock, (struct sockaddr *)&serv_addr, sizeof(serv_addr)) < 0) {
+        std::cerr << "Connection Failed" << std::endl;
+        return false;
+    }
+
+    send(sock, json_data.c_str(), json_data.size(), 0);
+    std::cout << "JSON sent!" << std::endl;
+
+    close(sock);
+    return true;
+}
+
+void sendImageAndJson(const std::string &server_ip, int server_port, const cv::Mat &frame, const std::string &json_data) {
+    // tạo kết nối socket
+    int sock = socket(AF_INET, SOCK_STREAM, 0);
+    if (sock < 0) {
+        std::cerr << "Socket creation error" << std::endl;
+        return;
+    }
+
+    struct sockaddr_in server_addr;
+    server_addr.sin_family = AF_INET;
+    server_addr.sin_port = htons(server_port);
+
+    if (inet_pton(AF_INET, server_ip.c_str(), &server_addr.sin_addr) <= 0) {
+        std::cerr << "Invalid address/ Address not supported" << std::endl;
+        close(sock);
+        return;
+    }
+
+    if (connect(sock, (struct sockaddr*)&server_addr, sizeof(server_addr)) < 0) {
+        std::cerr << "Connection failed" << std::endl;
+        close(sock);
+        return;
+    }
+
+// mã hóa hình ảnh frame cv::mat thành định dạng jpeg và lưu kết quả trong cái vector   
+    int sendbuf = 65536;  // Buffer 64KB
+    if (setsockopt(sock, SOL_SOCKET, SO_SNDBUF, &sendbuf, sizeof(sendbuf)) == -1) {
+        std::cerr << "Failed to set send buffer size" << std::endl;
+    }                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            
+    std::vector<uchar> encodedImage;
+
+    cv::imencode(".jpg", frame, encodedImage);
+    size_t json_size = json_data.size();
+    size_t image_size = encodedImage.size();
+    
+    send(sock, &json_size, sizeof(json_size), 0); // gửi kích thước trước
+    send(sock, &image_size, sizeof(image_size), 0);
+
+    // Send JSON data
+    send(sock, json_data.c_str(), json_size, 0);
+
+    // Send image data
+    send(sock, encodedImage.data(), image_size, 0); // gửi dữ liệu được mã hóa và kích thước của nó
+
+    close(sock);
+}
+
+int main() {
+    cout << "Starting ..............." << endl;
+
+    std::string server_ip = "192.168.0.141"; // Địa chỉ IP của server
+    int server_port = 8080; // Cổng của server
+
+    while (true) {
+        auto start_time = std::chrono::high_resolution_clock::now();  // Bắt đầu đo thời gian
+
+        rs2::pipeline pipeline;
+        rs2::config config;
+        config.enable_stream(RS2_STREAM_DEPTH, 640, 480, RS2_FORMAT_Z16, 30);
+        config.enable_stream(RS2_STREAM_COLOR, 640, 480, RS2_FORMAT_BGR8, 30);
+
+        cv::Ptr<cv::aruco::Dictionary> dictionary = cv::aruco::getPredefinedDictionary(cv::aruco::DICT_6X6_100);
+        cv::Ptr<cv::aruco::DetectorParameters> detectorParams = cv::aruco::DetectorParameters::create();
+
+        bool camera_connected = false;
+	
+        double FPS = 0;
+        int frame_counter = 0;
+        auto loop_start_time = std::chrono::high_resolution_clock::now(); 
+
+        while (!camera_connected) {
+            try {
+                auto profile = pipeline.start(config);
+                camera_connected = true;
+            } catch (const rs2::error& e) {
+                camera_connected = false;
+            }
+
+            Document document;
+            document.SetObject();
+            Document::AllocatorType& allocator = document.GetAllocator();
+
+            Value header(kObjectType);
+            Value status_value;
+            status_value.SetString("Disconnected", allocator);
+            Value message_value;
+            message_value.SetString("Not OK", allocator);
+
+            header.AddMember("status", status_value, allocator);
+            header.AddMember("message", message_value, allocator);
+
+            document.AddMember("header", header, allocator);
+            Value data(kObjectType); // Dữ liệu trống khi không có camera
+            document.AddMember("data", data, allocator);
+
+            StringBuffer buffer;
+            PrettyWriter<StringBuffer> writer(buffer);
+            document.Accept(writer);
+
+            cout << buffer.GetString() << endl;
+
+            // Gửi JSON khi không có camera kết nối
+            //send_json(server_ip, server_port, buffer.GetString());
+        }
+
+        // Vòng lặp xử lý khi camera đã kết nối
+        rs2_stream align_to = RS2_STREAM_COLOR;
+        rs2::align align(align_to);
+
+        while (camera_connected) {
+            auto current_time = std::chrono::high_resolution_clock::now();  // Bắt đầu đo thời gian vòng lặp
+
+            rs2::frameset frames = pipeline.wait_for_frames();
+            auto aligned_frames = align.process(static_cast<rs2::frameset>(frames));
+
+            rs2::depth_frame depth_frame = aligned_frames.get_depth_frame();
+            rs2::video_frame color_frame_aligned = aligned_frames.get_color_frame();
+
+            if (!depth_frame || !color_frame_aligned) {
+                continue;
+            }
+
+            rs2_intrinsics depth_intrin_aligned = depth_frame.get_profile().as<rs2::video_stream_profile>().get_intrinsics();
+
+            cv::Mat color_image_aligned(cv::Size(640, 480), CV_8UC3, (void*)color_frame_aligned.get_data(), cv::Mat::AUTO_STEP);
+            //sendImageToServer(server_ip, server_port, color_image_aligned);
+
+            vector<int> markerIds;
+            vector<vector<cv::Point2f>> aligned_marker_corners, rejectedCandidates;
+            cv::aruco::detectMarkers(color_image_aligned, dictionary, aligned_marker_corners, markerIds, detectorParams, rejectedCandidates);
+
+            vector<cv::Point2f> aligned_centers;
+            if (!aligned_marker_corners.empty()) {
+                for (const auto& marker : aligned_marker_corners) {
+                    float cX = (marker[0].x + marker[2].x) / 2.0f;
+                    float cY = (marker[0].y + marker[2].y) / 2.0f;
+                    aligned_centers.push_back(cv::Point2f(cX, cY));
+                }
+            }
+
+            Document document;
+            document.SetObject();
+            Document::AllocatorType& allocator = document.GetAllocator();
+
+            Value header(kObjectType);
+            Value status_value;
+            status_value.SetString("Connected", allocator);
+            Value message_value;
+            message_value.SetString("OK", allocator);
+
+            header.AddMember("status", status_value, allocator);
+            header.AddMember("message", message_value, allocator);
+            document.AddMember("header", header, allocator);
+
+            Value detection_result(kObjectType);
+	        Value data(kObjectType);
+
+            if (!markerIds.empty()) {
+                cv::Mat ids(markerIds);
+                ArucoResult result = aruco_display(aligned_marker_corners, aligned_centers, ids, color_image_aligned, depth_frame, depth_intrin_aligned);
+
+                if (result.dollyFound) {
+                    Value left_corner(kObjectType);
+                    left_corner.AddMember("X", result.point1_3d[0] * 100, allocator);
+                    left_corner.AddMember("Y", result.point1_3d[1] * (-100), allocator);
+                    left_corner.AddMember("Z", result.point1_3d[2] * 100 - 0.42, allocator);
+
+                    Value right_corner(kObjectType);
+                    right_corner.AddMember("X", result.point2_3d[0] * 100, allocator);
+                    right_corner.AddMember("Y", result.point2_3d[1] * (-100), allocator);
+                    right_corner.AddMember("Z", result.point2_3d[2] * 100 - 0.42, allocator);
+
+                    detection_result.AddMember("leftCorner", left_corner, allocator);
+                    detection_result.AddMember("rightCorner", right_corner, allocator);
+                    detection_result.AddMember("dollyFound", result.dollyFound, allocator);
+                    detection_result.AddMember("cornersDistance", result.cornersDistance, allocator);
+                } else {
+                    detection_result.AddMember("dollyFound", false, allocator);
+                }
+            } else {
+                detection_result.AddMember("dollyFound", false, allocator);
+            }
+
+            
+	    data.AddMember("detectionResult",detection_result, allocator); 
+	    document.AddMember("data", data, allocator);
+
+        StringBuffer buffer;
+        PrettyWriter<StringBuffer> writer(buffer);
+        document.Accept(writer);       
+
+        cout << buffer.GetString() << endl;
+
+        // Gửi JSON khi camera kết nối
+        //send_json(server_ip, server_port, buffer.GetString());
+        sendImageAndJson(server_ip, server_port,color_image_aligned, buffer.GetString());
+ 	    frame_counter ++;
+	    auto loop_end_time = std::chrono::high_resolution_clock::now(); 
+	    double time_pass = std::chrono::duration_cast<std::chrono::milliseconds>(loop_end_time - loop_start_time).count()/1000.0;
+	    if(time_pass >= 1.0)
+	    {
+		FPS = frame_counter / time_pass;
+		frame_counter = 0;
+		loop_start_time = loop_end_time;
+	    }
+	    putText(color_image_aligned, "FPS: " + std::to_string(FPS), cv::Point(10,30), cv::FONT_HERSHEY_SIMPLEX, 1, cv::Scalar(255,0,0), 2);
+            cv::imshow("image", color_image_aligned);
+            if (cv::waitKey(1) & 0xFF == 'q') {
+                break;
+            }
+
+        }
+
+        // Nếu mất kết nối camera, quay lại vòng lặp kiểm tra kết nối
+        camera_connected = false;
+        pipeline.stop(); // Dừng pipeline trước khi quay lại kiểm tra kết nối
+
+    }
+
+    return 0;
+}
